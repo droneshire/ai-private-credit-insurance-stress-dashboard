@@ -1,0 +1,26 @@
+[project]
+name = "ai-private-credit-insurance-stress-dashboard"
+version = "0.1.0"
+description = "Notebook monitoring AI, private-credit, and insurance stress indicators"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "requests>=2.32",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15",
+    "nbformat>=5.10",
+    "types-requests>=2.32",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["scripts"]
