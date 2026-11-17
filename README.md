@@ -51,3 +51,19 @@ The validator checks the notebook schema and compiles every code cell without ru
 ## Important limitation
 
 The scores are transparent monitoring heuristics, not forecasts, investment advice, or estimates of crisis probability. File-driven layers remain `NO DATA` until their CSV inputs are populated.
+
+## SEC BDC NAV ingestion (phase 2, partial)
+
+Set a GitHub Actions repository variable named `SEC_USER_AGENT` to a descriptive
+application name and contact email (SEC fair-access policy). When configured,
+CI runs `scripts/fetch_bdc_sec.py` before the notebook and exports
+`bdc_sec_nav.csv` and `bdc_sec_coverage.csv` in its artifacts.
+
+The adapter requests SEC companyfacts for ARCC, MAIN, OBDC and FSK, and uses
+only the comparable `us-gaap:NetAssetValuePerShare` tag when present.
+It explicitly reports missing tags and fetch failures. It does **not** fabricate
+PIK income, non-accrual rates, insurer exposures, or data-center ABS ratings.
+The dashboard continues to show private-credit and insurance layers as
+`NO DATA` until the corresponding verified inputs are supplied.
+
+This is not yet a prediction of insurer losses or a complete test of the thesis.
