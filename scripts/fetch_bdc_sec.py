@@ -17,7 +17,7 @@ OUT = Path("stress_dashboard_data/bdc_sec_nav.csv")
 TAG_CANDIDATES = ("NetAssetValuePerShare",)
 HEADERS = ("date", "ticker", "cik", "nav_per_share", "source_url", "filed_at", "tag")
 
-def extract_nav(payload: dict, ticker: str, cik: int) -> dict | None:
+def extract_nav(payload: dict[str, object], ticker: str, cik: int) -> dict[str, object] | None:
     facts = payload.get("facts", {}).get("us-gaap", {})
     rows = []
     for tag in TAG_CANDIDATES:
