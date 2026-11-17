@@ -10,6 +10,7 @@ import json
 import os
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 from urllib.request import Request, urlopen
 
 ISSUERS = {"ARCC": 1287750, "MAIN": 1396440, "OBDC": 1655888, "FSK": 1422183}
@@ -17,7 +18,7 @@ OUT = Path("stress_dashboard_data/bdc_sec_nav.csv")
 TAG_CANDIDATES = ("NetAssetValuePerShare",)
 HEADERS = ("date", "ticker", "cik", "nav_per_share", "source_url", "filed_at", "tag")
 
-def extract_nav(payload: dict[str, object], ticker: str, cik: int) -> dict[str, object] | None:
+def extract_nav(payload: dict[str, Any], ticker: str, cik: int) -> dict[str, object] | None:
     facts = payload.get("facts", {}).get("us-gaap", {})
     rows = []
     for tag in TAG_CANDIDATES:
