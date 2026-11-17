@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "mypy>=1.15",
     "nbformat>=5.10",
+    "pytest>=8.3",
     "types-requests>=2.32",
 ]
 
@@ -24,3 +25,8 @@ dev = [
 python_version = "3.12"
 strict = true
 files = ["scripts"]
+mypy_path = "scripts"
+
+[tool.pytest.ini_options]
+pythonpath = ["scripts"]
+testpaths = ["tests"]
