@@ -59,11 +59,19 @@ application name and contact email (SEC fair-access policy). When configured,
 CI runs `scripts/fetch_bdc_sec.py` before the notebook and exports
 `bdc_sec_nav.csv` and `bdc_sec_coverage.csv` in its artifacts.
 
-The adapter requests SEC companyfacts for ARCC, MAIN, OBDC and FSK, and uses
-only the comparable `us-gaap:NetAssetValuePerShare` tag when present.
-It explicitly reports missing tags and fetch failures. It does **not** fabricate
-PIK income, non-accrual rates, insurer exposures, or data-center ABS ratings.
-The dashboard continues to show private-credit and insurance layers as
-`NO DATA` until the corresponding verified inputs are supplied.
+The adapter requests SEC companyfacts for ARCC, MAIN, OBDC and FSK and fills
+`bdc_metrics.csv` for the last four quarters from standard us-gaap tags only:
+
+- `nav_per_share` and `nav_qoq_pct` from `NetAssetValuePerShare`
+- `pik_income_pct` = `InterestIncomeOperatingPaidInKind` / `GrossInvestmentIncomeOperating`
+  (quarters derived from year-to-date totals when only those are tagged; MAIN
+  does not tag PIK interest)
+
+Each row cites the filing that first reported the period. Non-accrual rates have
+no us-gaap tag, so `non_accrual_pct`, `realized_loss_pct` and `interest_coverage`
+stay blank; enter them by hand from 10-Q text and the collector keeps them on
+later runs. It explicitly reports missing tags and fetch failures, and does
+**not** fabricate values, insurer exposures, or data-center ABS ratings. The
+private-credit layer stays `NO DATA` until non-accruals are supplied.
 
 This is not yet a prediction of insurer losses or a complete test of the thesis.
