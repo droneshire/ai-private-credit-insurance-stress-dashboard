@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches-ignore: [gh-pages]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -71,3 +72,40 @@ jobs:
             stress_dashboard_report.html
             stress_dashboard_data/*.csv
           if-no-files-found: warn
+
+  publish:
+    # Publishes the report to GitHub Pages: the latest at the site root, dated
+    # copies kept for 14 days. Only main runs publish.
+    needs: validate
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.SEC_USER_AGENT != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-report
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: stress-dashboard-results
+          path: results
+      - name: Check out the currently published site
+        run: |
+          if git fetch --depth 1 origin gh-pages; then
+            git worktree add --detach previous FETCH_HEAD
+          fi
+      - name: Build site
+        run: |
+          previous=()
+          [ -d previous ] && previous=(--previous previous)
+          python3 scripts/build_site.py results/stress_dashboard_report.html site "${previous[@]}" --retention-days 14
+      - name: Publish as a single commit so expired reports leave no history
+        run: |
+          git -C site init -q -b gh-pages
+          git -C site add -A
+          git -C site -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Publish stress dashboard report"
+          git fetch -q site gh-pages
+          git push --force origin FETCH_HEAD:refs/heads/gh-pages

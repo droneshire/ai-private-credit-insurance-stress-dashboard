@@ -105,6 +105,11 @@ the repository Actions variable `SEC_USER_AGENT` to enable the collectors. The
 `stress-dashboard-results` artifact contains the executed notebook, `stress_dashboard_report.html` and
 every CSV.
 
+Runs on `main` also publish the report to GitHub Pages:
+https://droneshire.github.io/ai-private-credit-insurance-stress-dashboard/ always shows the latest
+report, and `archive.html` lists dated copies, which are deleted after 14 days. The `gh-pages` branch is
+rewritten as a single commit on each publish, so expired reports are not kept in its history.
+
 ## Development checks
 
     uv run python scripts/validate_notebook.py
