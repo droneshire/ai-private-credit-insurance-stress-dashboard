@@ -4,9 +4,13 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly refresh so the GPU price history keeps accumulating.
+    - cron: "17 13 * * 1"
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   validate:
@@ -24,13 +28,39 @@ jobs:
         run: uv run python scripts/validate_notebook.py
       - name: Type check
         run: uv run mypy scripts
-      - name: Fetch SEC BDC NAV when SEC identity is configured
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: Restore GPU price history from the last successful main run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name stress-dashboard-results --dir previous
+            mkdir -p stress_dashboard_data
+            cp previous/stress_dashboard_data/gpu_price_history.csv stress_dashboard_data/ || true
+          fi
+      - name: Fetch SEC BDC metrics when SEC identity is configured
         if: ${{ vars.SEC_USER_AGENT != '' }}
         env:
           SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
         run: uv run python scripts/fetch_bdc_sec.py
-      - name: Execute stress dashboard against live FRED data
-        run: uv run jupyter nbconvert --to notebook --execute ai_private_credit_insurance_stress_dashboard.ipynb --output executed.ipynb --ExecutePreprocessor.timeout=240
+      - name: Fetch SEC insurer balance sheets when SEC identity is configured
+        if: ${{ vars.SEC_USER_AGENT != '' }}
+        env:
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+        run: uv run python scripts/fetch_insurers_sec.py
+      - name: Fetch compute economics when SEC identity is configured
+        if: ${{ vars.SEC_USER_AGENT != '' }}
+        env:
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+        run: uv run python scripts/fetch_compute.py
+      - name: Execute stress dashboard against live data
+        run: uv run jupyter nbconvert --to notebook --execute ai_private_credit_insurance_stress_dashboard.ipynb --output executed.ipynb --ExecutePreprocessor.timeout=300
+      - name: Render HTML report
+        run: uv run jupyter nbconvert --to html executed.ipynb --output stress_dashboard_report.html
       - name: Upload dashboard results
         if: always()
         uses: actions/upload-artifact@v4
@@ -38,5 +68,6 @@ jobs:
           name: stress-dashboard-results
           path: |
             executed.ipynb
+            stress_dashboard_report.html
             stress_dashboard_data/*.csv
           if-no-files-found: warn

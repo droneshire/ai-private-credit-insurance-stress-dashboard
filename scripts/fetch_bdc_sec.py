@@ -1,109 +1,50 @@
-"""Fetch auditable SEC XBRL observations for selected BDCs.
+"""Fetch auditable SEC observations for selected BDCs.
 
-Writes NAV per share, NAV quarter-over-quarter change and PIK interest as a
-share of total investment income where the issuer tags the standard us-gaap
-concepts. Non-accrual rates have no comparable us-gaap concept; they remain
-blank rather than inferred from unrelated tags. Values entered by hand in
-bdc_metrics.csv fill the fields SEC leaves blank.
+From XBRL companyfacts (standard us-gaap tags only): NAV per share, NAV
+quarter-over-quarter change, PIK interest share of investment income, realized
+losses as a share of the portfolio, and interest coverage. Non-accrual rates
+have no us-gaap concept, so they are parsed from the earnings release (8-K
+item 2.02, exhibit 99) with the quoted sentence kept as evidence. Values
+entered by hand in bdc_metrics.csv fill the fields SEC leaves blank.
 """
 from __future__ import annotations
 
 import csv
 import json
-import os
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.request import Request, urlopen
+
+from release_text import NonAccrual, parse_non_accrual, quarter_end_before
+from sec_client import SecClient, filing_folder, html_to_text, sec_user_agent
+from xbrl_facts import first_quarterly_series, instant_series, is_quarter, quarterly_series
 
 ISSUERS = {"ARCC": 1287750, "MAIN": 1396440, "OBDC": 1655888, "FSK": 1422183}
 MANAGERS = {"ARCC": "Ares", "MAIN": "Main Street (internal)", "OBDC": "Blue Owl", "FSK": "FS/KKR"}
 OUT = Path("stress_dashboard_data/bdc_sec_nav.csv")
 METRICS_OUT = OUT.with_name("bdc_metrics.csv")
+EVIDENCE_OUT = OUT.with_name("bdc_non_accrual_evidence.csv")
 TAG_CANDIDATES = ("NetAssetValuePerShare",)
 PIK_TAG = "InterestIncomeOperatingPaidInKind"
 INCOME_TAG = "GrossInvestmentIncomeOperating"
+NII_TAG = "NetInvestmentIncome"
+PORTFOLIO_TAG = "InvestmentOwnedAtFairValue"
+# Priority order: the first tag an issuer reports for a quarter is used.
+REALIZED_TAGS = (
+    "RealizedInvestmentGainsLosses",
+    "DebtAndEquitySecuritiesRealizedGainLoss",
+    "RealizedGainLossInvestmentDerivativeAndForeignCurrencyTransactionPriceChangeOperatingBeforeTax",
+    "RealizedGainLossInvestmentDerivativeAndForeignCurrencyTransactionPriceChangeOperatingAfterTax",
+)
+INTEREST_TAGS = ("InterestExpense", "InterestExpenseOperating", "InterestExpenseDebt")
 HEADERS = ("date", "ticker", "cik", "nav_per_share", "source_url", "filed_at", "tag")
 METRIC_HEADERS = (
-    "date", "ticker", "manager", "non_accrual_pct", "pik_income_pct",
+    "date", "ticker", "manager", "non_accrual_pct", "non_accrual_fv_pct", "pik_income_pct",
     "nav_per_share", "nav_qoq_pct", "realized_loss_pct", "interest_coverage",
     "source_url", "notes",
 )
+EVIDENCE_HEADERS = ("date", "ticker", "non_accrual_pct", "non_accrual_fv_pct", "source_url", "quote")
 QUARTERS_KEPT = 4
-
-# (value, filed, accession) for one reporting period.
-Fact = tuple[float, date, str]
-
-
-def _filing_url(cik: int, accession: str) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession.replace('-', '')}/"
-
-
-def _is_quarter(start: date, end: date) -> bool:
-    return 80 <= (end - start).days <= 100
-
-
-def _facts(payload: dict[str, Any], tag: str, unit: str) -> list[dict[str, Any]]:
-    values: list[dict[str, Any]] = (
-        payload.get("facts", {}).get("us-gaap", {}).get(tag, {}).get("units", {}).get(unit, [])
-    )
-    today = date.today()
-    out = []
-    for value in values:
-        if value.get("form") not in ("10-Q", "10-K"):
-            continue
-        if not all(k in value for k in ("end", "filed", "val", "accn")):
-            continue
-        try:
-            end = date.fromisoformat(value["end"])
-            filed = date.fromisoformat(value["filed"])
-            start = date.fromisoformat(value["start"]) if "start" in value else None
-            val = float(value["val"])
-        except (ValueError, TypeError):
-            continue
-        if end > today or filed > today:
-            continue
-        out.append({"start": start, "end": end, "filed": filed, "val": val, "accn": value["accn"]})
-    return out
-
-
-def _latest_revision(facts: list[dict[str, Any]]) -> dict[tuple[date | None, date], Fact]:
-    """Key facts by period with the latest revised value, cited to the first filing reporting it.
-
-    Later filings repeat prior periods as comparatives; the original filing is
-    the auditable source unless the value was restated.
-    """
-    best: dict[tuple[date | None, date], Fact] = {}
-    for f in sorted(facts, key=lambda x: x["filed"]):
-        key = (f["start"], f["end"])
-        if key not in best or f["val"] != best[key][0]:
-            best[key] = (f["val"], f["filed"], f["accn"])
-    return best
-
-
-def instant_series(payload: dict[str, Any], tag: str, unit: str) -> dict[date, Fact]:
-    return {end: fact for (_, end), fact in _latest_revision(_facts(payload, tag, unit)).items()}
-
-
-def quarterly_series(payload: dict[str, Any], tag: str, unit: str = "USD") -> dict[date, Fact]:
-    """Three-month values per quarter end, derived from year-to-date facts when needed.
-
-    Many 10-Qs tag only six- and nine-month totals; the quarter is the
-    difference between consecutive year-to-date values sharing a start date.
-    """
-    periods = _latest_revision(_facts(payload, tag, unit))
-    out: dict[date, Fact] = {}
-    for (start, end), fact in periods.items():
-        if start is not None and _is_quarter(start, end):
-            out[end] = fact
-    for (start, end), (val, filed, accn) in periods.items():
-        if start is None or end in out:
-            continue
-        for (prior_start, prior_end), (prior_val, _, _) in periods.items():
-            if prior_start == start and _is_quarter(prior_end, end):
-                out[end] = (val - prior_val, filed, accn)
-                break
-    return out
 
 
 def extract_nav(payload: dict[str, Any], ticker: str, cik: int) -> dict[str, object] | None:
@@ -118,47 +59,90 @@ def extract_nav(payload: dict[str, Any], ticker: str, cik: int) -> dict[str, obj
     end, filed, nav, tag, accession = max(rows, key=lambda x: (x[0], x[1]))
     return {
         "date": end.isoformat(), "ticker": ticker, "cik": cik,
-        "nav_per_share": nav, "source_url": _filing_url(cik, accession),
+        "nav_per_share": nav, "source_url": filing_folder(cik, accession),
         "filed_at": filed.isoformat(), "tag": tag,
     }
 
 
-def extract_metrics(payload: dict[str, Any], ticker: str, cik: int) -> list[dict[str, object]]:
-    """One row per recent quarter end with NAV, NAV QoQ % and PIK share of income."""
-    nav = {
-        end: fact
-        for end, fact in instant_series(payload, TAG_CANDIDATES[0], "USD/shares").items()
-        if fact[0] > 0
-    }
+def extract_metrics(
+    payload: dict[str, Any],
+    ticker: str,
+    cik: int,
+    non_accruals: dict[date, tuple[NonAccrual, str]] | None = None,
+) -> list[dict[str, object]]:
+    """One row per recent quarter end from XBRL facts plus parsed non-accruals."""
+    non_accruals = non_accruals or {}
+    nav = {end: f for end, f in instant_series(payload, TAG_CANDIDATES[0], "USD/shares").items() if f[0] > 0}
+    portfolio = instant_series(payload, PORTFOLIO_TAG)
     pik = quarterly_series(payload, PIK_TAG)
     income = quarterly_series(payload, INCOME_TAG)
+    nii = quarterly_series(payload, NII_TAG)
+    realized = first_quarterly_series(payload, REALIZED_TAGS)
+    interest = first_quarterly_series(payload, INTEREST_TAGS)
     rows: list[dict[str, object]] = []
     for end in sorted(nav)[-QUARTERS_KEPT:]:
         value, _, accn = nav[end]
-        prior = next((nav[d][0] for d in nav if d < end and _is_quarter(d, end)), None)
-        notes = ["SEC XBRL; non_accrual_pct has no us-gaap tag"]
-        pik_pct: object = ""
-        if end in pik and end in income and income[end][0] > 0:
-            pik_pct = round(100 * pik[end][0] / income[end][0], 2)
-        else:
-            missing = PIK_TAG if end not in pik else INCOME_TAG
-            notes.append(f"pik_income_pct unavailable: {missing} not tagged")
-        rows.append({
+        prior = next((nav[d][0] for d in nav if d < end and is_quarter(d, end)), None)
+        notes = ["SEC XBRL"]
+        row: dict[str, object] = {
             "date": end.isoformat(), "ticker": ticker, "manager": MANAGERS.get(ticker, ""),
-            "non_accrual_pct": "", "pik_income_pct": pik_pct,
+            "non_accrual_pct": "", "non_accrual_fv_pct": "", "pik_income_pct": "",
             "nav_per_share": value,
             "nav_qoq_pct": "" if prior is None else round(100 * (value / prior - 1), 2),
             "realized_loss_pct": "", "interest_coverage": "",
-            "source_url": _filing_url(cik, accn), "notes": "; ".join(notes),
-        })
+            "source_url": filing_folder(cik, accn),
+        }
+        if end in pik and end in income and income[end][0] > 0:
+            row["pik_income_pct"] = round(100 * pik[end][0] / income[end][0], 2)
+        else:
+            notes.append(f"pik_income_pct: {PIK_TAG if end not in pik else INCOME_TAG} not tagged")
+        if end in realized and end in portfolio and portfolio[end][0] > 0:
+            (gain, _, _), tag = realized[end]
+            # Positive = net realized loss, as % of the portfolio at fair value for the quarter.
+            row["realized_loss_pct"] = round(-100 * gain / portfolio[end][0], 3)
+            notes.append(f"realized: {tag}")
+        else:
+            notes.append("realized_loss_pct: no realized gain/loss tag")
+        if end in interest and end in nii and interest[end][0][0] > 0:
+            (expense, _, _), tag = interest[end]
+            row["interest_coverage"] = round((nii[end][0] + expense) / expense, 2)
+            notes.append(f"coverage: ({NII_TAG} + {tag}) / {tag}")
+        else:
+            notes.append("interest_coverage: interest expense not tagged")
+        if end in non_accruals:
+            found, url = non_accruals[end]
+            row["non_accrual_pct"] = found.at_cost_pct
+            row["non_accrual_fv_pct"] = found.at_fair_value_pct
+            notes.append(f"non-accrual: earnings release {url}")
+        else:
+            notes.append("non_accrual_pct: not found in earnings release")
+        row["notes"] = "; ".join(notes)
+        rows.append(row)
     return rows
+
+
+def fetch_non_accruals(client: SecClient, cik: int, limit: int = 10) -> dict[date, tuple[NonAccrual, str]]:
+    """Non-accruals from recent earnings releases, keyed by the quarter each reports.
+
+    A later release for the same quarter (e.g. final after preliminary) wins.
+    """
+    found: dict[date, tuple[NonAccrual, str]] = {}
+    for filing in sorted(client.filings(cik, ("8-K",), item="2.02")[:limit], key=lambda f: f["filed"]):
+        for doc_type, url in client.documents(cik, filing["accession"]):
+            if not doc_type.startswith("EX-99") or not url.lower().endswith((".htm", ".html", ".txt")):
+                continue
+            parsed = parse_non_accrual(html_to_text(client.get_text(url)))
+            if parsed:
+                found[quarter_end_before(filing["filed"])] = (parsed, url)
+                break
+    return found
 
 
 def merge_manual(sec_rows: list[dict[str, object]], path: Path) -> list[dict[str, object]]:
     """Fill gaps in SEC rows with hand-entered values, keeping manual-only rows.
 
     SEC values win where present so reruns pick up restatements; hand entries
-    supply fields XBRL lacks (non-accruals, realized losses, coverage).
+    supply fields SEC lacks.
     """
     if not path.exists():
         return list(sec_rows)
@@ -167,52 +151,58 @@ def merge_manual(sec_rows: list[dict[str, object]], path: Path) -> list[dict[str
     merged: list[dict[str, object]] = []
     for row in sec_rows:
         hand = manual.pop((str(row["date"]), str(row["ticker"])), {})
-        merged.append({k: hand.get(k, "") if v == "" else v for k, v in row.items()})
-    merged.extend({k: r.get(k, "") for k in METRIC_HEADERS} for r in manual.values())
+        merged.append({k: hand.get(k) or "" if v == "" else v for k, v in row.items()})
+    merged.extend({k: r.get(k) or "" for k in METRIC_HEADERS} for r in manual.values())
     return merged
 
 
+def write_csv(path: Path, headers: tuple[str, ...], rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main() -> None:
-    agent = os.getenv("SEC_USER_AGENT", "").strip()
-    if not agent:
-        raise SystemExit("Set SEC_USER_AGENT to a descriptive name and contact email per SEC guidance")
+    client = SecClient(sec_user_agent())
     OUT.parent.mkdir(parents=True, exist_ok=True)
     observations = []
     metrics: list[dict[str, object]] = []
-    coverage = []
+    evidence: list[dict[str, object]] = []
+    coverage: list[dict[str, object]] = []
     for ticker, cik in ISSUERS.items():
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+        status: dict[str, object] = {"ticker": ticker, "status": "", "pik": "", "non_accrual": "", "error": ""}
         try:
-            request = Request(url, headers={"User-Agent": agent, "Accept": "application/json"})
-            with urlopen(request, timeout=30) as response:
-                payload = json.load(response)
+            payload = client.companyfacts(cik)
             result = extract_nav(payload, ticker, cik)
             if result:
                 observations.append(result)
-            issuer_metrics = extract_metrics(payload, ticker, cik)
+            try:
+                non_accruals = fetch_non_accruals(client, cik)
+            except Exception as exc:
+                non_accruals = {}
+                status["error"] = f"earnings releases: {str(exc)[:200]}"
+            issuer_metrics = extract_metrics(payload, ticker, cik, non_accruals)
             metrics.extend(issuer_metrics)
-            has_pik = bool(issuer_metrics) and issuer_metrics[-1]["pik_income_pct"] != ""
-            coverage.append({
-                "ticker": ticker,
-                "status": "NAV FOUND" if result else "NO COMPARABLE NAV TAG",
-                "pik": "PIK FOUND" if has_pik else "NO COMPARABLE PIK TAG",
-                "error": "",
-            })
+            evidence.extend(
+                {"date": end.isoformat(), "ticker": ticker, "non_accrual_pct": na.at_cost_pct,
+                 "non_accrual_fv_pct": na.at_fair_value_pct, "source_url": url, "quote": na.quote}
+                for end, (na, url) in sorted(non_accruals.items())
+            )
+            latest = issuer_metrics[-1] if issuer_metrics else {}
+            status["status"] = "NAV FOUND" if result else "NO COMPARABLE NAV TAG"
+            status["pik"] = "PIK FOUND" if latest.get("pik_income_pct", "") != "" else "NO COMPARABLE PIK TAG"
+            status["non_accrual"] = (
+                "NON-ACCRUAL FOUND" if latest.get("non_accrual_pct", "") != "" else "NOT FOUND IN RELEASE"
+            )
         except Exception as exc:
-            coverage.append({"ticker": ticker, "status": "FETCH FAILED", "pik": "", "error": str(exc)[:250]})
-    with OUT.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=HEADERS)
-        writer.writeheader()
-        writer.writerows(observations)
+            status.update(status="FETCH FAILED", error=str(exc)[:250])
+        coverage.append(status)
+    write_csv(OUT, HEADERS, observations)
     merged = sorted(merge_manual(metrics, METRICS_OUT), key=lambda r: (str(r["ticker"]), str(r["date"])))
-    with METRICS_OUT.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=METRIC_HEADERS)
-        writer.writeheader()
-        writer.writerows(merged)
-    with OUT.with_name("bdc_sec_coverage.csv").open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=("ticker", "status", "pik", "error"))
-        writer.writeheader()
-        writer.writerows(coverage)
+    write_csv(METRICS_OUT, METRIC_HEADERS, merged)
+    write_csv(EVIDENCE_OUT, EVIDENCE_HEADERS, evidence)
+    write_csv(OUT.with_name("bdc_sec_coverage.csv"), ("ticker", "status", "pik", "non_accrual", "error"), coverage)
     print(json.dumps({"nav_observations": len(observations), "metric_rows": len(merged), "coverage": coverage}, indent=2))
 
 
